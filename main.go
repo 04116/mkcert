@@ -23,6 +23,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/idna"
 )
@@ -47,6 +48,12 @@ const shortUsage = `Usage of mkcert:
 `
 
 const advancedUsage = `Advanced options:
+
+  -ca-root-expire-at
+      The time (must be in RFC3339 layout) that root ca will be expired.
+
+  -cert-expire-at
+      The time (must be in RFC3339 layout) that cert will be expired.
 
 	-cert-file FILE, -key-file FILE, -p12-file FILE
 	    Customize the output paths.
@@ -79,6 +86,16 @@ const advancedUsage = `Advanced options:
 
 `
 
+const certTooLongWarn = `
+  Certificates longer than 825 days, the limit that macOS/iOS apply to all certificates,
+  including custom roots. See https://support.apple.com/en-us/HT210176.
+`
+
+var (
+	defaultCertExpireAt   = time.Now().AddDate(2, 3, 0)
+	defaultRootCAExpireAt = time.Now().AddDate(10, 0, 0)
+)
+
 // Version can be set at link time to override debug.BuildInfo.Main.Version,
 // which is "(devel)" when building from within the module. See
 // golang.org/issue/29814 and golang.org/issue/29228.
@@ -91,18 +108,20 @@ func main() {
 	}
 	log.SetFlags(0)
 	var (
-		installFlag   = flag.Bool("install", false, "")
-		uninstallFlag = flag.Bool("uninstall", false, "")
-		pkcs12Flag    = flag.Bool("pkcs12", false, "")
-		ecdsaFlag     = flag.Bool("ecdsa", false, "")
-		clientFlag    = flag.Bool("client", false, "")
-		helpFlag      = flag.Bool("help", false, "")
-		carootFlag    = flag.Bool("CAROOT", false, "")
-		csrFlag       = flag.String("csr", "", "")
-		certFileFlag  = flag.String("cert-file", "", "")
-		keyFileFlag   = flag.String("key-file", "", "")
-		p12FileFlag   = flag.String("p12-file", "", "")
-		versionFlag   = flag.Bool("version", false, "")
+		installFlag        = flag.Bool("install", false, "")
+		caRootExpireAtFlag = flag.String("ca-root-expire-at", defaultRootCAExpireAt.Format(time.RFC3339), "")
+		uninstallFlag      = flag.Bool("uninstall", false, "")
+		pkcs12Flag         = flag.Bool("pkcs12", false, "")
+		ecdsaFlag          = flag.Bool("ecdsa", false, "")
+		clientFlag         = flag.Bool("client", false, "")
+		helpFlag           = flag.Bool("help", false, "")
+		carootFlag         = flag.Bool("CAROOT", false, "")
+		csrFlag            = flag.String("csr", "", "")
+		certExpireAtFlag   = flag.String("cert-expire-at", defaultCertExpireAt.Format(time.RFC3339), "")
+		certFileFlag       = flag.String("cert-file", "", "")
+		keyFileFlag        = flag.String("key-file", "", "")
+		p12FileFlag        = flag.String("p12-file", "", "")
+		versionFlag        = flag.Bool("version", false, "")
 	)
 	flag.Usage = func() {
 		fmt.Fprint(flag.CommandLine.Output(), shortUsage)
@@ -142,25 +161,53 @@ func main() {
 	if *csrFlag != "" && flag.NArg() != 0 {
 		log.Fatalln("ERROR: can't specify extra arguments when using -csr")
 	}
+
+	println(*certExpireAtFlag, *caRootExpireAtFlag)
+
+	caRootExpireAt, err := time.Parse(time.RFC3339, *caRootExpireAtFlag)
+	if err != nil {
+		log.Fatal("ERROR: parse caRootExpireAt err: ", err)
+	}
+	if time.Now().After(caRootExpireAt) {
+		log.Fatal("ERROR: caRootExpireAt in the past")
+	}
+
+	certExpireAt, err := time.Parse(time.RFC3339, *certExpireAtFlag)
+	if err != nil {
+		log.Fatal("ERROR: parse certExpireAt err: ", err)
+	}
+	if time.Now().After(certExpireAt) {
+		log.Fatal("ERROR: certExpireAt in the past")
+	}
+	if certExpireAt.After(defaultCertExpireAt) {
+		log.Println(certTooLongWarn)
+	}
+
 	(&mkcert{
-		installMode: *installFlag, uninstallMode: *uninstallFlag, csrPath: *csrFlag,
+		caRootExpireAt: caRootExpireAt,
+		installMode:    *installFlag, uninstallMode: *uninstallFlag, csrPath: *csrFlag,
 		pkcs12: *pkcs12Flag, ecdsa: *ecdsaFlag, client: *clientFlag,
 		certFile: *certFileFlag, keyFile: *keyFileFlag, p12File: *p12FileFlag,
+		certExpireAt: certExpireAt,
 	}).Run(flag.Args())
 }
 
-const rootName = "rootCA.pem"
-const rootKeyName = "rootCA-key.pem"
+const (
+	rootName    = "rootCA.pem"
+	rootKeyName = "rootCA-key.pem"
+)
 
 type mkcert struct {
 	installMode, uninstallMode bool
 	pkcs12, ecdsa, client      bool
 	keyFile, certFile, p12File string
+	certExpireAt               time.Time
 	csrPath                    string
 
-	CAROOT string
-	caCert *x509.Certificate
-	caKey  crypto.PrivateKey
+	CAROOT         string
+	caCert         *x509.Certificate
+	caKey          crypto.PrivateKey
+	caRootExpireAt time.Time
 
 	// The system cert pool is only loaded once. After installing the root, checks
 	// will keep failing until the next execution. TODO: maybe execve?
